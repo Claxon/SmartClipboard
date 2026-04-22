@@ -26,6 +26,7 @@ def _make_icon() -> QIcon:
 class TrayController(QObject):
     open_history = Signal()
     open_popup = Signal()
+    open_settings = Signal()
     quit_requested = Signal()
 
     def __init__(self, parent: QObject | None = None):
@@ -34,15 +35,19 @@ class TrayController(QObject):
         self.tray.setToolTip("SmartClipboard")
 
         menu = QMenu()
-        act_history = QAction("Open history (Ctrl+Shift+V)", menu)
-        act_history.triggered.connect(self.open_history)
-        menu.addAction(act_history)
+        self.act_history = QAction("Open history", menu)
+        self.act_history.triggered.connect(self.open_history)
+        menu.addAction(self.act_history)
 
-        act_popup = QAction("Cycle popup (Ctrl+/)", menu)
-        act_popup.triggered.connect(self.open_popup)
-        menu.addAction(act_popup)
+        self.act_popup = QAction("Cycle popup", menu)
+        self.act_popup.triggered.connect(self.open_popup)
+        menu.addAction(self.act_popup)
 
         menu.addSeparator()
+
+        act_settings = QAction("Settings…", menu)
+        act_settings.triggered.connect(self.open_settings)
+        menu.addAction(act_settings)
 
         self.act_startup = QAction("Run at startup", menu)
         self.act_startup.setCheckable(True)
@@ -59,6 +64,13 @@ class TrayController(QObject):
         self.tray.setContextMenu(menu)
         self.tray.activated.connect(self._on_activated)
         self.tray.show()
+
+    def update_hotkey_labels(self, bindings: dict[str, str]) -> None:
+        """Refresh menu labels when bindings change."""
+        history = bindings.get("open_history", "")
+        popup = bindings.get("cycle_popup", "")
+        self.act_history.setText(f"Open history ({history})" if history else "Open history")
+        self.act_popup.setText(f"Cycle popup ({popup})" if popup else "Cycle popup")
 
     def _on_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
         if reason == QSystemTrayIcon.Trigger:

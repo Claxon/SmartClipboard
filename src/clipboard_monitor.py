@@ -66,16 +66,20 @@ class ClipboardMonitor(QObject):
     def __init__(self, store: HistoryStore, parent: QObject | None = None):
         super().__init__(parent)
         self._store = store
-        self._ignore_next = False
+        self._ignore_count = 0
         cb = QGuiApplication.clipboard()
         cb.dataChanged.connect(self._on_changed)
 
-    def set_ignore_next(self) -> None:
-        self._ignore_next = True
+    def set_ignore_next(self, count: int = 1) -> None:
+        self._ignore_count += max(0, count)
+
+    def read_current(self) -> HistoryItem | None:
+        cb = QGuiApplication.clipboard()
+        return item_from_mime(cb.mimeData())
 
     def _on_changed(self) -> None:
-        if self._ignore_next:
-            self._ignore_next = False
+        if self._ignore_count > 0:
+            self._ignore_count -= 1
             return
         cb = QGuiApplication.clipboard()
         mime = cb.mimeData()

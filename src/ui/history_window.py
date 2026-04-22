@@ -17,8 +17,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..clipboard_monitor import apply_to_clipboard
+from ..clipboard_monitor import ClipboardMonitor, apply_to_clipboard
+from ..config import Config
+from ..foreground import get_foreground_hwnd
 from ..history import HistoryItem, HistoryStore, ItemKind
+from ..paste import paste_to
 from .popup import _item_icon, _kind_badge_text
 from .theme import APP_STYLE
 
@@ -67,9 +70,18 @@ class HistoryRow(QWidget):
 
 
 class HistoryWindow(QWidget):
-    def __init__(self, store: HistoryStore, parent: QWidget | None = None):
+    def __init__(
+        self,
+        store: HistoryStore,
+        config: Config,
+        monitor: ClipboardMonitor | None = None,
+        parent: QWidget | None = None,
+    ):
         super().__init__(parent)
         self._store = store
+        self._config = config
+        self._monitor = monitor
+        self._target_hwnd: int = 0
         store.changed.connect(self._refresh)
 
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool | Qt.WindowStaysOnTopHint)
@@ -115,9 +127,18 @@ class HistoryWindow(QWidget):
 
         QShortcut(QKeySequence(Qt.Key_Escape), self, activated=self.hide)
         QShortcut(QKeySequence(Qt.Key_Delete), self, activated=self._on_delete)
+        QShortcut(QKeySequence(Qt.Key_Return), self, activated=self._activate_selected)
+        QShortcut(QKeySequence(Qt.Key_Enter), self, activated=self._activate_selected)
+
+    def _activate_selected(self) -> None:
+        cur = self._list.currentItem()
+        if cur is not None:
+            self._on_activated(cur)
 
     def show_at_cursor(self) -> None:
         self._refresh()
+        # record the window we were invoked from so we can paste back into it
+        self._target_hwnd = get_foreground_hwnd()
         screen = QGuiApplication.screenAt(QGuiApplication.primaryScreen().geometry().center())
         if screen is None:
             screen = QGuiApplication.primaryScreen()
@@ -128,6 +149,8 @@ class HistoryWindow(QWidget):
         self.show()
         self.raise_()
         self.activateWindow()
+        if self._list.count() > 0 and self._list.currentRow() < 0:
+            self._list.setCurrentRow(0)
 
     def _refresh(self) -> None:
         self._list.clear()
@@ -152,9 +175,15 @@ class HistoryWindow(QWidget):
         item = self._store.get(iid)
         if item is None:
             return
+        target = self._target_hwnd
+        if self._monitor is not None:
+            self._monitor.set_ignore_next(1)
         apply_to_clipboard(item)
         self._store.add(item)
         self.hide()
+        from PySide6.QtCore import QTimer
+        if self._config.auto_paste_on_confirm and target:
+            QTimer.singleShot(30, lambda: paste_to(target))
 
     def _on_delete(self) -> None:
         iid = self._selected_item_id()

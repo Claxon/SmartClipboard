@@ -64,3 +64,8 @@ def _foreground_center() -> Optional[tuple[int, int]]:
 def anchor_screen_pos() -> Optional[tuple[int, int]]:
     """Best-effort screen-space point to anchor a popup against: caret > cursor > window center."""
     return _caret_screen_pos() or _cursor_screen_pos() or _foreground_center()
+
+
+def get_foreground_hwnd() -> int:
+    """Return the current foreground window handle (as an int), or 0."""
+    return int(user32.GetForegroundWindow() or 0)

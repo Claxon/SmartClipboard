@@ -15,13 +15,14 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..clipboard_monitor import apply_to_clipboard
-from ..foreground import anchor_screen_pos
+from ..clipboard_monitor import ClipboardMonitor, apply_to_clipboard
+from ..config import Config
+from ..foreground import anchor_screen_pos, get_foreground_hwnd
 from ..history import HistoryItem, HistoryStore, ItemKind
+from ..paste import paste_to
 from .theme import APP_STYLE
 
 
-AUTO_CONFIRM_MS = 1400
 MAX_VISIBLE = 7
 
 
@@ -44,11 +45,14 @@ def _item_icon(item: HistoryItem, size: int = 40) -> QPixmap:
 
 
 class ItemCard(QFrame):
+    clicked = Signal()
+
     def __init__(self, item: HistoryItem, parent: QWidget | None = None):
         super().__init__(parent)
         self.setObjectName("Card")
         self.setProperty("selected", False)
         self._item = item
+        self.setCursor(Qt.PointingHandCursor)
 
         root = QHBoxLayout(self)
         root.setContentsMargins(10, 8, 10, 8)
@@ -96,17 +100,33 @@ class ItemCard(QFrame):
         self.style().unpolish(self)
         self.style().polish(self)
 
+    def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
 
 class CyclingPopup(QWidget):
     confirmed = Signal(str)
     cancelled = Signal()
 
-    def __init__(self, store: HistoryStore, parent: QWidget | None = None):
+    def __init__(
+        self,
+        store: HistoryStore,
+        config: Config,
+        monitor: ClipboardMonitor | None = None,
+        parent: QWidget | None = None,
+    ):
         super().__init__(parent)
         self._store = store
+        self._config = config
+        self._monitor = monitor
         self._items: list[HistoryItem] = []
         self._selected = 0
         self._cards: list[ItemCard] = []
+        self._target_hwnd: int = 0
 
         self.setWindowFlags(
             Qt.FramelessWindowHint
@@ -149,11 +169,16 @@ class CyclingPopup(QWidget):
 
         self.resize(560, 60)
 
+    def _timeout_ms(self) -> int:
+        return max(200, int(self._config.popup_timeout_ms))
+
     def advance(self, step: int = 1) -> None:
         items = self._store.items[:MAX_VISIBLE]
         if not items:
             return
         if not self.isVisible():
+            # record the window we were invoked from so we can paste back into it
+            self._target_hwnd = get_foreground_hwnd()
             anchor = anchor_screen_pos()
             self._items = items
             self._selected = 0
@@ -163,11 +188,11 @@ class CyclingPopup(QWidget):
             self.raise_()
             self.activateWindow()
             self.setFocus(Qt.ActiveWindowFocusReason)
-            self._timer.start(AUTO_CONFIRM_MS)
+            self._timer.start(self._timeout_ms())
             return
         self._selected = (self._selected + step) % len(self._items)
         self._update_selection()
-        self._timer.start(AUTO_CONFIRM_MS)
+        self._timer.start(self._timeout_ms())
 
     def _rebuild(self) -> None:
         while self._cards_layout.count():
@@ -176,12 +201,18 @@ class CyclingPopup(QWidget):
             if w is not None:
                 w.deleteLater()
         self._cards = []
-        for item in self._items:
+        for idx, item in enumerate(self._items):
             card = ItemCard(item)
+            card.clicked.connect(lambda i=idx: self._on_card_clicked(i))
             self._cards.append(card)
             self._cards_layout.addWidget(card)
         self._update_selection()
         self.adjustSize()
+
+    def _on_card_clicked(self, idx: int) -> None:
+        self._selected = idx
+        self._update_selection()
+        self._confirm()
 
     def _update_selection(self) -> None:
         for idx, card in enumerate(self._cards):
@@ -215,12 +246,22 @@ class CyclingPopup(QWidget):
 
     def _confirm(self) -> None:
         self._timer.stop()
-        if self._items and 0 <= self._selected < len(self._items):
-            chosen = self._items[self._selected]
-            apply_to_clipboard(chosen)
-            self._store.add(chosen)
-            self.confirmed.emit(chosen.id)
+        if not (self._items and 0 <= self._selected < len(self._items)):
+            self.hide()
+            return
+        chosen = self._items[self._selected]
+        if self._monitor is not None:
+            # two events expected: our clipboard write + Ctrl+V round-trip won't change it,
+            # but the dataChanged listener still fires once for the write.
+            self._monitor.set_ignore_next(1)
+        apply_to_clipboard(chosen)
+        self._store.add(chosen)
+        self.confirmed.emit(chosen.id)
+        target = self._target_hwnd
         self.hide()
+        if self._config.auto_paste_on_confirm and target:
+            # give Qt a moment to hide + focus-change before synthesizing input
+            QTimer.singleShot(30, lambda: paste_to(target))
 
     def _cancel(self) -> None:
         self._timer.stop()
