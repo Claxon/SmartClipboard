@@ -187,6 +187,7 @@ class CyclingPopup(QWidget):
         self._target_hwnd: int = 0
         self._ctrl_mode = False  # opened with Ctrl held → confirm on release
         self._hover_tracker = HoverTracker()
+        self._current_buffer_id = "main"
 
         self.setWindowFlags(
             Qt.FramelessWindowHint
@@ -210,11 +211,15 @@ class CyclingPopup(QWidget):
         layout.setSpacing(8)
 
         header = QHBoxLayout()
-        title = QLabel("Clipboard · Cycle")
-        title.setObjectName("Title")
+        header.setSpacing(8)
+        self._title_lbl = QLabel("Clipboard")
+        self._title_lbl.setObjectName("Title")
+        self._buffer_lbl = QLabel("")
+        self._buffer_lbl.setObjectName("BufferBadge")
         self._hint = QLabel("release Ctrl to paste · Esc cancel")
         self._hint.setObjectName("Hint")
-        header.addWidget(title)
+        header.addWidget(self._title_lbl)
+        header.addWidget(self._buffer_lbl)
         header.addStretch(1)
         header.addWidget(self._hint)
         layout.addLayout(header)
@@ -241,24 +246,36 @@ class CyclingPopup(QWidget):
     def _total(self) -> int:
         return len(self._items) + 1  # +1 for the cancel row
 
+    def _buffer_ids(self) -> list[str]:
+        return [b.config.id for b in self._store.buffers]
+
+    def _load_buffer(self, buffer_id: str) -> None:
+        """Snapshot items from the given buffer (or Main as fallback)."""
+        buf = self._store.get(buffer_id) or self._store.get("main")
+        if buf is None:
+            self._items = []
+            self._current_buffer_id = buffer_id
+            self._buffer_lbl.setText("")
+            return
+        self._current_buffer_id = buf.config.id
+        self._items = buf.items[:MAX_VISIBLE]
+        self._selected = 0
+        # Header badge shows the buffer name + arrows hint if multiple exist.
+        total_buffers = len(self._buffer_ids())
+        if total_buffers > 1:
+            self._buffer_lbl.setText(f"◀  {buf.config.name}  ▶")
+        else:
+            self._buffer_lbl.setText(buf.config.name)
+
     def advance(self, step: int = 1) -> None:
-        main = self._store.get("main")
-        if main is None:
-            return
-        items = main.items[:MAX_VISIBLE]
-        if not items:
-            return
         if not self.isVisible():
             self._target_hwnd = get_foreground_hwnd()
             anchor = anchor_screen_pos()
-            self._items = items
-            self._selected = 0
+            self._load_buffer("main")
+            # if Main is empty, fall through and show empty state (user can
+            # still press Left/Right to a buffer that has items, or Esc/Cancel)
             self._ctrl_mode = bool(self._config.ctrl_release_confirms and _is_ctrl_down())
-            self._hint.setText(
-                "release Ctrl to paste · Esc cancel"
-                if self._ctrl_mode
-                else "Enter paste · Esc cancel · click to select"
-            )
+            self._hint.setText(self._hint_text())
             self._rebuild()
             self._place_at(anchor)
             self.show()
@@ -271,10 +288,35 @@ class CyclingPopup(QWidget):
                 self._timer.start(self._timeout_ms())
             return
         total = self._total()
+        if total == 0:
+            return
         self._selected = (self._selected + step) % total
         self._update_selection()
         if not self._ctrl_mode:
             self._timer.start(self._timeout_ms())
+
+    def switch_buffer(self, step: int = 1) -> None:
+        """Cycle to the previous/next buffer (left/right arrows)."""
+        ids = self._buffer_ids()
+        if not ids:
+            return
+        if self._current_buffer_id in ids:
+            idx = ids.index(self._current_buffer_id)
+        else:
+            idx = 0
+        new_idx = (idx + step) % len(ids)
+        self._load_buffer(ids[new_idx])
+        self._rebuild()
+        self._place_at(anchor_screen_pos())
+        if not self._ctrl_mode:
+            self._timer.start(self._timeout_ms())
+
+    def _hint_text(self) -> str:
+        multi = len(self._buffer_ids()) > 1
+        arrow_hint = " · ←→ buffer" if multi else ""
+        if self._ctrl_mode:
+            return f"release Ctrl to paste · Esc cancel{arrow_hint}"
+        return f"Enter paste · Esc cancel · click to select{arrow_hint}"
 
     # --- rendering -----
 
@@ -375,7 +417,8 @@ class CyclingPopup(QWidget):
         if self._monitor is not None:
             self._monitor.set_ignore_next(1)
         apply_to_clipboard(chosen)
-        self._store.add_to("main", chosen)
+        # Re-insert into the source buffer (bubbles to top via dedup).
+        self._store.add_to(self._current_buffer_id, chosen)
         self.confirmed.emit(chosen.id)
         target = self._target_hwnd
         self.hide()
@@ -403,6 +446,12 @@ class CyclingPopup(QWidget):
             return
         if key in (Qt.Key_Up, Qt.Key_Backtab):
             self.advance(-1)
+            return
+        if key == Qt.Key_Right:
+            self.switch_buffer(1)
+            return
+        if key == Qt.Key_Left:
+            self.switch_buffer(-1)
             return
         if key == Qt.Key_Slash:
             step = -1 if event.modifiers() & Qt.ShiftModifier else 1

@@ -38,6 +38,14 @@ QLabel#KindBadge {
     letter-spacing: 0.5px;
     text-transform: uppercase;
 }
+QLabel#BufferBadge {
+    color: #8fb8ff;
+    font-size: 11px;
+    padding: 2px 8px;
+    background: #202637;
+    border: 1px solid #2b3450;
+    border-radius: 6px;
+}
 QFrame#Card {
     background: #23262e;
     border: 1px solid #2f333e;
