@@ -163,12 +163,9 @@ class SelectionBuffer(QObject):
             cb = QGuiApplication.clipboard()
             text = cb.text()
             if text and len(text.strip()) >= self._min_chars:
-                # avoid pushing duplicates of the current secondary head
-                secondary = self._store.secondary
-                if not secondary or secondary[0].text != text:
-                    item = HistoryItem(id=make_id(), kind=ItemKind.TEXT, timestamp=now(), text=text)
-                    self._store.push_secondary(item)
-                    self.captured.emit(text)
+                item = HistoryItem(id=make_id(), kind=ItemKind.TEXT, timestamp=now(), text=text)
+                self._store.capture_selection(item)
+                self.captured.emit(text)
         finally:
             # restore prior clipboard contents (if any) — this fires another dataChanged
             if self._saved_item is not None:

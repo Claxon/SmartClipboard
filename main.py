@@ -8,7 +8,7 @@ from PySide6.QtWidgets import QApplication, QMessageBox, QSystemTrayIcon
 
 from src import single_instance
 from src.clipboard_monitor import ClipboardMonitor, apply_to_clipboard, item_from_mime
-from src.config import Config
+from src.config import Config, hotkey_map
 from src.history import HistoryStore
 from src.hotkeys import HotkeyManager
 from src.paste import send_ctrl_v
@@ -25,13 +25,13 @@ class SmartClipboardApp:
         self.app.setQuitOnLastWindowClosed(False)
 
         self.config = Config.load()
-        self.store = HistoryStore()
+        self.store = HistoryStore(configs=self.config.buffers)
         self.monitor = ClipboardMonitor(self.store)
         self.popup = CyclingPopup(self.store, self.config, self.monitor)
         self.history_window = HistoryWindow(self.store, self.config, self.monitor)
         self.tray = TrayController()
-        self.tray.update_hotkey_labels(self.config.bindings)
-        self.hotkeys = HotkeyManager(self.config.bindings)
+        self.tray.update_hotkey_labels(self.config.global_bindings)
+        self.hotkeys = HotkeyManager(hotkey_map(self.config))
 
         self.selection = SelectionBuffer(
             self.store, self.monitor, min_chars=self.config.selection_min_chars
@@ -54,27 +54,50 @@ class SmartClipboardApp:
         cb = QGuiApplication.clipboard()
         item = item_from_mime(cb.mimeData())
         if item is not None:
-            self.store.add(item)
+            self.store.capture_from_main(item)
 
     def _on_hotkey(self, name: str) -> None:
         if name == "cycle_popup":
             self.popup.advance(1)
-        elif name == "open_history":
+            return
+        if name == "open_history":
             self.history_window.show_at_cursor()
-        elif name == "push_secondary":
-            items = self.store.items
-            if items:
-                self.store.push_secondary(items[0])
-                self.tray.notify("SmartClipboard", f"Pinned: {items[0].preview[:60]}")
-        elif name == "paste_secondary":
-            sec = self.store.secondary
-            if not sec:
-                self.tray.notify("SmartClipboard", "Secondary buffer is empty.")
-                return
-            item = sec[0]
-            self.monitor.set_ignore_next(1)
-            apply_to_clipboard(item)
-            QTimer.singleShot(80, send_ctrl_v)
+            return
+        if name.startswith("paste:"):
+            bid = name.split(":", 1)[1]
+            self._paste_from_buffer(bid)
+            return
+        if name.startswith("capture:"):
+            bid = name.split(":", 1)[1]
+            self._capture_current_into(bid)
+            return
+
+    def _paste_from_buffer(self, bid: str) -> None:
+        buf = self.store.get(bid)
+        if buf is None:
+            return
+        head = buf.head()
+        if head is None:
+            self.tray.notify("SmartClipboard", f"{buf.config.name} is empty.")
+            return
+        self.monitor.set_ignore_next(1)
+        apply_to_clipboard(head)
+        QTimer.singleShot(80, send_ctrl_v)
+
+    def _capture_current_into(self, bid: str) -> None:
+        buf = self.store.get(bid)
+        if buf is None:
+            return
+        item = self.monitor.read_current()
+        if item is None:
+            self.tray.notify("SmartClipboard", "Clipboard is empty.")
+            return
+        if not buf.accepts(item):
+            kinds = ", ".join(k.value for k in buf.config.accepted_kinds)
+            self.tray.notify("SmartClipboard", f"{buf.config.name} only accepts: {kinds}")
+            return
+        self.store.add_to(bid, item)
+        self.tray.notify("SmartClipboard", f"Copied to {buf.config.name}: {item.preview[:60]}")
 
     def _open_settings(self) -> None:
         if self._settings_window is not None and self._settings_window.isVisible():
@@ -88,14 +111,16 @@ class SmartClipboardApp:
 
     def _apply_new_config(self, new_config: Config) -> None:
         self.config = new_config
-        # rebind hotkeys at runtime (no restart needed)
-        self.hotkeys.rebind(new_config.bindings)
-        # propagate settings to components
-        self.popup._config = new_config  # timer + auto_paste read live
+        # Rebuild store's buffer set (preserves items for persisted ids)
+        self.store.replace_configs(new_config.buffers)
+        # Rebind hotkeys live
+        self.hotkeys.rebind(hotkey_map(new_config))
+        # Propagate to components
+        self.popup._config = new_config
         self.history_window._config = new_config
         self.selection.set_min_chars(new_config.selection_min_chars)
         self.selection.set_enabled(new_config.selection_buffer_enabled)
-        self.tray.update_hotkey_labels(new_config.bindings)
+        self.tray.update_hotkey_labels(new_config.global_bindings)
         self.tray.notify("SmartClipboard", "Settings saved.")
 
     def _quit(self) -> None:
@@ -106,8 +131,6 @@ class SmartClipboardApp:
 
 def main() -> int:
     if not single_instance.acquire():
-        # Quiet second-instance exit with a brief toast. We need a QApplication
-        # just long enough to show a tray balloon (no window created).
         tmp = QApplication(sys.argv)
         if QSystemTrayIcon.isSystemTrayAvailable():
             from src.ui.tray import _make_icon

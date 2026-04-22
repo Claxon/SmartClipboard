@@ -86,5 +86,5 @@ class ClipboardMonitor(QObject):
         item = item_from_mime(mime)
         if item is None:
             return
-        if self._store.add(item):
-            self.item_captured.emit(item)
+        self._store.capture_from_main(item)
+        self.item_captured.emit(item)

@@ -47,6 +47,24 @@ QFrame#Card[selected="true"] {
     border: 1px solid #6aa3ff;
     background: #28334a;
 }
+QFrame#CancelCard {
+    background: #1e2028;
+    border: 1px solid #2a2e38;
+    border-radius: 10px;
+    margin-top: 4px;
+}
+QFrame#CancelCard[selected="true"] {
+    border: 1px solid #b96a6a;
+    background: #3a2729;
+}
+QLabel#CancelLabel {
+    color: #c2a4a4;
+    font-size: 12px;
+    letter-spacing: 0.3px;
+}
+QFrame#CancelCard[selected="true"] QLabel#CancelLabel {
+    color: #f3d3d3;
+}
 QListWidget {
     background: #181a20;
     border: 1px solid #2c303a;

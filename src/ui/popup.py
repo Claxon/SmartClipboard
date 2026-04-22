@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import ctypes
 from pathlib import Path
-from typing import Optional
 
-from PySide6.QtCore import QEvent, QPoint, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QPoint, QTimer, Qt, Signal
 from PySide6.QtGui import QColor, QFontMetrics, QGuiApplication, QKeyEvent, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -20,10 +20,19 @@ from ..config import Config
 from ..foreground import anchor_screen_pos, get_foreground_hwnd
 from ..history import HistoryItem, HistoryStore, ItemKind
 from ..paste import paste_to
+from .preview import HoverTracker
 from .theme import APP_STYLE
 
 
-MAX_VISIBLE = 7
+user32 = ctypes.windll.user32
+VK_CONTROL = 0x11
+
+
+def _is_ctrl_down() -> bool:
+    return bool(user32.GetAsyncKeyState(VK_CONTROL) & 0x8000)
+
+
+MAX_VISIBLE = 8
 
 
 def _kind_badge_text(kind: ItemKind) -> str:
@@ -46,6 +55,7 @@ def _item_icon(item: HistoryItem, size: int = 40) -> QPixmap:
 
 class ItemCard(QFrame):
     clicked = Signal()
+    hovered = Signal(object)  # HistoryItem | None
 
     def __init__(self, item: HistoryItem, parent: QWidget | None = None):
         super().__init__(parent)
@@ -53,14 +63,15 @@ class ItemCard(QFrame):
         self.setProperty("selected", False)
         self._item = item
         self.setCursor(Qt.PointingHandCursor)
+        self.setMouseTracking(True)
+        self.setAttribute(Qt.WA_Hover, True)
 
         root = QHBoxLayout(self)
         root.setContentsMargins(10, 8, 10, 8)
         root.setSpacing(10)
 
         icon_label = QLabel()
-        pm = _item_icon(item)
-        icon_label.setPixmap(pm)
+        icon_label.setPixmap(_item_icon(item))
         icon_label.setFixedSize(48, 48)
         icon_label.setAlignment(Qt.AlignCenter)
         root.addWidget(icon_label)
@@ -95,6 +106,52 @@ class ItemCard(QFrame):
 
         root.addLayout(text_wrap, 1)
 
+    def item(self) -> HistoryItem:
+        return self._item
+
+    def set_selected(self, value: bool) -> None:
+        self.setProperty("selected", "true" if value else "false")
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def enterEvent(self, event) -> None:  # type: ignore[override]
+        self.hovered.emit(self._item)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:  # type: ignore[override]
+        self.hovered.emit(None)
+        super().leaveEvent(event)
+
+
+class CancelCard(QFrame):
+    clicked = Signal()
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setObjectName("CancelCard")
+        self.setProperty("selected", False)
+        self.setCursor(Qt.PointingHandCursor)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(10, 6, 10, 6)
+        lay.setSpacing(8)
+
+        lbl = QLabel("✕  Cancel")
+        lbl.setObjectName("CancelLabel")
+        lay.addWidget(lbl)
+        lay.addStretch(1)
+
+        hint = QLabel("release Ctrl or click")
+        hint.setObjectName("Hint")
+        lay.addWidget(hint)
+
     def set_selected(self, value: bool) -> None:
         self.setProperty("selected", "true" if value else "false")
         self.style().unpolish(self)
@@ -126,7 +183,10 @@ class CyclingPopup(QWidget):
         self._items: list[HistoryItem] = []
         self._selected = 0
         self._cards: list[ItemCard] = []
+        self._cancel_card: CancelCard | None = None
         self._target_hwnd: int = 0
+        self._ctrl_mode = False  # opened with Ctrl held → confirm on release
+        self._hover_tracker = HoverTracker()
 
         self.setWindowFlags(
             Qt.FramelessWindowHint
@@ -152,11 +212,11 @@ class CyclingPopup(QWidget):
         header = QHBoxLayout()
         title = QLabel("Clipboard · Cycle")
         title.setObjectName("Title")
-        hint = QLabel("Ctrl+/ next · Shift+Ctrl+/ prev · Enter paste · Esc cancel")
-        hint.setObjectName("Hint")
+        self._hint = QLabel("release Ctrl to paste · Esc cancel")
+        self._hint.setObjectName("Hint")
         header.addWidget(title)
         header.addStretch(1)
-        header.addWidget(hint)
+        header.addWidget(self._hint)
         layout.addLayout(header)
 
         self._cards_layout = QVBoxLayout()
@@ -167,32 +227,56 @@ class CyclingPopup(QWidget):
         self._timer.setSingleShot(True)
         self._timer.timeout.connect(self._auto_confirm)
 
+        self._ctrl_timer = QTimer(self)
+        self._ctrl_timer.setInterval(25)
+        self._ctrl_timer.timeout.connect(self._poll_ctrl)
+
         self.resize(560, 60)
+
+    # --- show/advance -----
 
     def _timeout_ms(self) -> int:
         return max(200, int(self._config.popup_timeout_ms))
 
+    def _total(self) -> int:
+        return len(self._items) + 1  # +1 for the cancel row
+
     def advance(self, step: int = 1) -> None:
-        items = self._store.items[:MAX_VISIBLE]
+        main = self._store.get("main")
+        if main is None:
+            return
+        items = main.items[:MAX_VISIBLE]
         if not items:
             return
         if not self.isVisible():
-            # record the window we were invoked from so we can paste back into it
             self._target_hwnd = get_foreground_hwnd()
             anchor = anchor_screen_pos()
             self._items = items
             self._selected = 0
+            self._ctrl_mode = bool(self._config.ctrl_release_confirms and _is_ctrl_down())
+            self._hint.setText(
+                "release Ctrl to paste · Esc cancel"
+                if self._ctrl_mode
+                else "Enter paste · Esc cancel · click to select"
+            )
             self._rebuild()
             self._place_at(anchor)
             self.show()
             self.raise_()
             self.activateWindow()
             self.setFocus(Qt.ActiveWindowFocusReason)
-            self._timer.start(self._timeout_ms())
+            if self._ctrl_mode:
+                self._ctrl_timer.start()
+            else:
+                self._timer.start(self._timeout_ms())
             return
-        self._selected = (self._selected + step) % len(self._items)
+        total = self._total()
+        self._selected = (self._selected + step) % total
         self._update_selection()
-        self._timer.start(self._timeout_ms())
+        if not self._ctrl_mode:
+            self._timer.start(self._timeout_ms())
+
+    # --- rendering -----
 
     def _rebuild(self) -> None:
         while self._cards_layout.count():
@@ -204,8 +288,12 @@ class CyclingPopup(QWidget):
         for idx, item in enumerate(self._items):
             card = ItemCard(item)
             card.clicked.connect(lambda i=idx: self._on_card_clicked(i))
+            card.hovered.connect(self._on_card_hover)
             self._cards.append(card)
             self._cards_layout.addWidget(card)
+        self._cancel_card = CancelCard()
+        self._cancel_card.clicked.connect(self._cancel)
+        self._cards_layout.addWidget(self._cancel_card)
         self._update_selection()
         self.adjustSize()
 
@@ -214,9 +302,21 @@ class CyclingPopup(QWidget):
         self._update_selection()
         self._confirm()
 
+    def _on_card_hover(self, item) -> None:
+        if item is None:
+            self._hover_tracker.cancel()
+            self._hover_tracker.hide_if_current()
+            return
+        # compute anchor near the cursor
+        pos = QGuiApplication.screens()[0].geometry().topLeft() if False else None  # dummy
+        from PySide6.QtGui import QCursor
+        self._hover_tracker.schedule(item, QCursor.pos())
+
     def _update_selection(self) -> None:
         for idx, card in enumerate(self._cards):
             card.set_selected(idx == self._selected)
+        if self._cancel_card is not None:
+            self._cancel_card.set_selected(self._selected == len(self._items))
 
     def _place_at(self, anchor: tuple[int, int] | None) -> None:
         self.adjustSize()
@@ -229,52 +329,74 @@ class CyclingPopup(QWidget):
         ax, ay = anchor
         screen = QGuiApplication.screenAt(QPoint(ax, ay)) or QGuiApplication.primaryScreen()
         geo = screen.availableGeometry()
-        # offset: slightly right of and below the caret, like IME/autocomplete popups
         x = ax - 24
         y = ay + 18
-        # if we'd clip the bottom, flip above the caret line
         if y + h > geo.y() + geo.height() - 8:
             y = ay - h - 8
         x = max(geo.x() + 8, min(x, geo.x() + geo.width() - w - 8))
         y = max(geo.y() + 8, min(y, geo.y() + geo.height() - h - 8))
         self.move(x, y)
 
+    # --- input -----
+
+    def _poll_ctrl(self) -> None:
+        if not self.isVisible():
+            self._ctrl_timer.stop()
+            return
+        if not _is_ctrl_down():
+            self._ctrl_timer.stop()
+            if self._selected == len(self._items):
+                self._cancel()
+            else:
+                self._confirm()
+
     def _auto_confirm(self) -> None:
         if not self.isVisible():
             return
-        self._confirm()
+        if self._ctrl_mode:
+            # in ctrl-release mode the timer is only used until the user moves;
+            # don't auto-confirm while they're still holding Ctrl.
+            if _is_ctrl_down():
+                return
+        if self._selected == len(self._items):
+            self._cancel()
+        else:
+            self._confirm()
 
     def _confirm(self) -> None:
         self._timer.stop()
+        self._ctrl_timer.stop()
+        self._hover_tracker.cancel()
+        self._hover_tracker.hide_if_current()
         if not (self._items and 0 <= self._selected < len(self._items)):
             self.hide()
             return
         chosen = self._items[self._selected]
         if self._monitor is not None:
-            # two events expected: our clipboard write + Ctrl+V round-trip won't change it,
-            # but the dataChanged listener still fires once for the write.
             self._monitor.set_ignore_next(1)
         apply_to_clipboard(chosen)
-        self._store.add(chosen)
+        self._store.add_to("main", chosen)
         self.confirmed.emit(chosen.id)
         target = self._target_hwnd
         self.hide()
         if self._config.auto_paste_on_confirm and target:
-            # give Qt a moment to hide + focus-change before synthesizing input
             QTimer.singleShot(30, lambda: paste_to(target))
 
     def _cancel(self) -> None:
         self._timer.stop()
+        self._ctrl_timer.stop()
+        self._hover_tracker.cancel()
+        self._hover_tracker.hide_if_current()
         self.hide()
         self.cancelled.emit()
 
-    def keyPressEvent(self, event: QKeyEvent) -> None:
+    def keyPressEvent(self, event: QKeyEvent) -> None:  # type: ignore[override]
         key = event.key()
-        if key in (Qt.Key_Escape,):
+        if key == Qt.Key_Escape:
             self._cancel()
             return
         if key in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Space):
-            self._confirm()
+            self._confirm() if self._selected < len(self._items) else self._cancel()
             return
         if key in (Qt.Key_Down, Qt.Key_Tab):
             self.advance(1)
@@ -290,7 +412,12 @@ class CyclingPopup(QWidget):
 
     def focusOutEvent(self, event):  # type: ignore[override]
         super().focusOutEvent(event)
-        self._cancel()
+        # In ctrl-release mode we don't want to cancel on focus loss because Qt
+        # occasionally thinks we lost focus during the show+activate dance.
+        if not self._ctrl_mode:
+            self._cancel()
 
-    def mousePressEvent(self, event) -> None:  # click outside cards = confirm top
-        super().mousePressEvent(event)
+    def hideEvent(self, event) -> None:  # type: ignore[override]
+        self._hover_tracker.cancel()
+        self._hover_tracker.hide_if_current()
+        super().hideEvent(event)

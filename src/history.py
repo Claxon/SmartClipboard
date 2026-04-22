@@ -17,6 +17,9 @@ class ItemKind(str, Enum):
     IMAGE = "image"
 
 
+ALL_KINDS: frozenset[ItemKind] = frozenset({ItemKind.TEXT, ItemKind.FILES, ItemKind.IMAGE})
+
+
 @dataclass
 class HistoryItem:
     id: str
@@ -56,23 +59,72 @@ class HistoryItem:
         return (self.kind,)
 
 
-class HistoryStore(QObject):
-    changed = Signal()
+# --- Buffer model -----------------------------------------------------------
 
-    def __init__(self, max_items: int = 200, secondary_max: int = 20):
-        super().__init__()
+
+@dataclass
+class BufferConfig:
+    id: str
+    name: str = "Buffer"
+    accepted_kinds: list[ItemKind] = field(default_factory=lambda: list(ALL_KINDS))
+    track_main: bool = True  # auto-mirror items that the main clipboard captures
+    max_items: int = 200
+    paste_chord: str = ""      # hotkey that pastes this buffer's head
+    capture_chord: str = ""    # hotkey that copies the current primary clipboard into this buffer
+    auto_capture_selection: bool = False  # receive drag-selected text from the mouse hook
+    protected: bool = False    # if True, cannot be deleted from UI (used for "main")
+
+    def accepts(self, item: HistoryItem) -> bool:
+        return item.kind in self.accepted_kinds
+
+
+def make_id() -> str:
+    return uuid.uuid4().hex[:12]
+
+
+def now() -> float:
+    return time.time()
+
+
+def default_buffer_configs() -> list[BufferConfig]:
+    return [
+        BufferConfig(
+            id="main",
+            name="Main",
+            accepted_kinds=list(ALL_KINDS),
+            track_main=True,
+            max_items=200,
+            protected=True,
+        ),
+        BufferConfig(
+            id="selection",
+            name="Selection",
+            accepted_kinds=[ItemKind.TEXT],
+            track_main=False,
+            max_items=50,
+            paste_chord="Ctrl+Alt+V",
+            capture_chord="Ctrl+Alt+C",
+            auto_capture_selection=True,
+        ),
+    ]
+
+
+class Buffer:
+    """One clipboard buffer's contents."""
+
+    def __init__(self, cfg: BufferConfig):
+        self.config = cfg
         self._items: list[HistoryItem] = []
-        self._max = max_items
-        self._secondary: list[HistoryItem] = []
-        self._secondary_max = secondary_max
 
     @property
     def items(self) -> list[HistoryItem]:
         return list(self._items)
 
-    @property
-    def secondary(self) -> list[HistoryItem]:
-        return list(self._secondary)
+    def head(self) -> Optional[HistoryItem]:
+        return self._items[0] if self._items else None
+
+    def accepts(self, item: HistoryItem) -> bool:
+        return self.config.accepts(item)
 
     def add(self, item: HistoryItem) -> bool:
         if self._items and self._items[0].signature() == item.signature():
@@ -82,38 +134,112 @@ class HistoryStore(QObject):
                 self._items.remove(existing)
                 break
         self._items.insert(0, item)
-        if len(self._items) > self._max:
-            self._items = self._items[: self._max]
-        self.changed.emit()
+        if len(self._items) > max(1, self.config.max_items):
+            self._items = self._items[: self.config.max_items]
         return True
 
     def remove(self, item_id: str) -> None:
         self._items = [i for i in self._items if i.id != item_id]
-        self.changed.emit()
 
     def clear(self) -> None:
         self._items.clear()
-        self.changed.emit()
-
-    def push_secondary(self, item: HistoryItem) -> None:
-        self._secondary.insert(0, item)
-        if len(self._secondary) > self._secondary_max:
-            self._secondary = self._secondary[: self._secondary_max]
-        self.changed.emit()
-
-    def get(self, item_id: str) -> Optional[HistoryItem]:
-        for i in self._items:
-            if i.id == item_id:
-                return i
-        for i in self._secondary:
-            if i.id == item_id:
-                return i
-        return None
 
 
-def make_id() -> str:
-    return uuid.uuid4().hex[:12]
+class HistoryStore(QObject):
+    """Holds an ordered collection of Buffers keyed by id."""
 
+    changed = Signal(str)  # buffer id that changed, or "" for structural changes
 
-def now() -> float:
-    return time.time()
+    def __init__(self, configs: list[BufferConfig] | None = None):
+        super().__init__()
+        self._buffers: dict[str, Buffer] = {}
+        for cfg in (configs or default_buffer_configs()):
+            self._buffers[cfg.id] = Buffer(cfg)
+
+    # --- structural -----
+
+    @property
+    def buffers(self) -> list[Buffer]:
+        return list(self._buffers.values())
+
+    def get(self, buffer_id: str) -> Optional[Buffer]:
+        return self._buffers.get(buffer_id)
+
+    def add_buffer(self, cfg: BufferConfig) -> Buffer:
+        if cfg.id in self._buffers:
+            # update config in place and return the existing Buffer
+            self._buffers[cfg.id].config = cfg
+            self.changed.emit("")
+            return self._buffers[cfg.id]
+        buf = Buffer(cfg)
+        self._buffers[cfg.id] = buf
+        self.changed.emit("")
+        return buf
+
+    def remove_buffer(self, buffer_id: str) -> bool:
+        buf = self._buffers.get(buffer_id)
+        if buf is None or buf.config.protected:
+            return False
+        del self._buffers[buffer_id]
+        self.changed.emit("")
+        return True
+
+    def replace_configs(self, configs: list[BufferConfig]) -> None:
+        """Replace the buffer set with new configs, keeping items for ids that persist."""
+        old = self._buffers
+        new: dict[str, Buffer] = {}
+        for cfg in configs:
+            if cfg.id in old:
+                buf = old[cfg.id]
+                buf.config = cfg
+                new[cfg.id] = buf
+            else:
+                new[cfg.id] = Buffer(cfg)
+        self._buffers = new
+        self.changed.emit("")
+
+    # --- item flow -----
+
+    def capture_from_main(self, item: HistoryItem) -> None:
+        """Called when the system clipboard changes. Routes to tracking buffers."""
+        for buf in self._buffers.values():
+            if buf.config.track_main and buf.accepts(item):
+                if buf.add(item):
+                    self.changed.emit(buf.config.id)
+
+    def capture_selection(self, item: HistoryItem) -> None:
+        """Called by the drag-selection hook. Routes to auto-capture buffers."""
+        for buf in self._buffers.values():
+            if buf.config.auto_capture_selection and buf.accepts(item):
+                if buf.add(item):
+                    self.changed.emit(buf.config.id)
+
+    def add_to(self, buffer_id: str, item: HistoryItem) -> bool:
+        buf = self._buffers.get(buffer_id)
+        if buf is None or not buf.accepts(item):
+            return False
+        ok = buf.add(item)
+        if ok:
+            self.changed.emit(buffer_id)
+        return ok
+
+    def remove_item(self, buffer_id: str, item_id: str) -> None:
+        buf = self._buffers.get(buffer_id)
+        if buf is None:
+            return
+        buf.remove(item_id)
+        self.changed.emit(buffer_id)
+
+    def clear_buffer(self, buffer_id: str) -> None:
+        buf = self._buffers.get(buffer_id)
+        if buf is None:
+            return
+        buf.clear()
+        self.changed.emit(buffer_id)
+
+    def find_item(self, item_id: str) -> tuple[Optional[str], Optional[HistoryItem]]:
+        for bid, buf in self._buffers.items():
+            for it in buf.items:
+                if it.id == item_id:
+                    return bid, it
+        return None, None
