@@ -33,6 +33,10 @@ def _is_ctrl_down() -> bool:
 
 
 MAX_VISIBLE = 8
+CARD_H = 64
+CANCEL_H = 36
+CARD_SPACING = 6
+POPUP_W = 560
 
 
 def _kind_badge_text(kind: ItemKind) -> str:
@@ -65,6 +69,7 @@ class ItemCard(QFrame):
         self.setCursor(Qt.PointingHandCursor)
         self.setMouseTracking(True)
         self.setAttribute(Qt.WA_Hover, True)
+        self.setFixedHeight(CARD_H)
 
         root = QHBoxLayout(self)
         root.setContentsMargins(10, 8, 10, 8)
@@ -138,6 +143,7 @@ class CancelCard(QFrame):
         self.setObjectName("CancelCard")
         self.setProperty("selected", False)
         self.setCursor(Qt.PointingHandCursor)
+        self.setFixedHeight(CANCEL_H)
 
         lay = QHBoxLayout(self)
         lay.setContentsMargins(10, 6, 10, 6)
@@ -224,9 +230,22 @@ class CyclingPopup(QWidget):
         header.addWidget(self._hint)
         layout.addLayout(header)
 
-        self._cards_layout = QVBoxLayout()
-        self._cards_layout.setSpacing(6)
-        layout.addLayout(self._cards_layout)
+        # Fixed-height cards area so the popup doesn't resize when buffers /
+        # item counts change. Items pack at the top, the Cancel row pins to
+        # the bottom, and any empty space is pushed between them by a stretch.
+        self._cards_host = QWidget()
+        self._cards_host.setObjectName("CardsHost")
+        self._cards_layout = QVBoxLayout(self._cards_host)
+        self._cards_layout.setContentsMargins(0, 0, 0, 0)
+        self._cards_layout.setSpacing(CARD_SPACING)
+        cards_h = (
+            MAX_VISIBLE * CARD_H
+            + (MAX_VISIBLE - 1) * CARD_SPACING
+            + CARD_SPACING
+            + CANCEL_H
+        )
+        self._cards_host.setFixedHeight(cards_h)
+        layout.addWidget(self._cards_host)
 
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
@@ -236,7 +255,10 @@ class CyclingPopup(QWidget):
         self._ctrl_timer.setInterval(25)
         self._ctrl_timer.timeout.connect(self._poll_ctrl)
 
-        self.resize(560, 60)
+        # Lock the overall popup size. Height = chrome + cards area; anything
+        # that used to call adjustSize() is now a no-op.
+        chrome_h = 18 * 2 + 14 * 2 + 22 + 8  # outer, root padding, header, layout spacing
+        self.setFixedSize(POPUP_W, cards_h + chrome_h)
 
     # --- show/advance -----
 
@@ -326,6 +348,8 @@ class CyclingPopup(QWidget):
             w = child.widget()
             if w is not None:
                 w.deleteLater()
+            # Spacers (returned by QLayoutItem) are also torn down here;
+            # takeAt() removes them from the layout.
         self._cards = []
         for idx, item in enumerate(self._items):
             card = ItemCard(item)
@@ -333,11 +357,13 @@ class CyclingPopup(QWidget):
             card.hovered.connect(self._on_card_hover)
             self._cards.append(card)
             self._cards_layout.addWidget(card)
+        # Stretch fills whatever vertical space remains, keeping Cancel pinned
+        # to the bottom and items packed at the top regardless of item count.
+        self._cards_layout.addStretch(1)
         self._cancel_card = CancelCard()
         self._cancel_card.clicked.connect(self._cancel)
         self._cards_layout.addWidget(self._cancel_card)
         self._update_selection()
-        self.adjustSize()
 
     def _on_card_clicked(self, idx: int) -> None:
         self._selected = idx
@@ -361,7 +387,7 @@ class CyclingPopup(QWidget):
             self._cancel_card.set_selected(self._selected == len(self._items))
 
     def _place_at(self, anchor: tuple[int, int] | None) -> None:
-        self.adjustSize()
+        # Size is fixed via setFixedSize in __init__; no adjustSize needed.
         w, h = self.width(), self.height()
         if anchor is None:
             screen = QGuiApplication.primaryScreen()
